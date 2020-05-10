@@ -34,6 +34,7 @@ def load_args():
     parser.add_argument("--batch-size", type=int, default=1e3,
         help="Write these many examples at a time to the file (otherwise OOM error)")
     parser.add_argument("--splits", type=str, default='train')
+    parser.add_argument("--min-freq", type=int, default=1)
 
     return parser.parse_args()
 
@@ -89,11 +90,11 @@ def process(split='train'):
     # Till now, no tokenization, no vocabulary
 
     start_time = time.time()
-    TEXT_en.build_vocab(ds_train)
+    TEXT_en.build_vocab(ds_train, min_freq=args.min_freq)
     print("EN Vocab Built. Time Taken:{}s".format(time.time() - start_time))
 
     start_time = time.time()
-    TEXT_de.build_vocab(ds_train)
+    TEXT_de.build_vocab(ds_train, min_freq=args.min_freq)
     print("DE Vocab Built. Time Taken:{}s".format(time.time() - start_time))
 
     sorted(examples, key=lambda x: len(x.src)) # x.src is a list of tokenized src sentence

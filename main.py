@@ -29,11 +29,15 @@ LATEST_CKPT_NAME = "latest"
 def compute_bleu(candidates, references, vocab):
 
     special_tokens = [vocab['de']['stoi'][t] for t in ['<pad>', '<sos>', '<eos>']]
+    ignore_tokens = [vocab['de']['stoi'][t] for t in [' ']]
 
     def _clean(x, special_tokens):
         """Remove the padding tokens"""
         ret = []
         for t in list(x.numpy()):
+            if t in ignore_tokens:
+                # ignore whitespace in the translation
+                continue
             if t not in special_tokens:
                 ret.append(t)
                 continue
@@ -59,7 +63,7 @@ def compute_bleu(candidates, references, vocab):
     candidates = []
     
     for ref in _references:
-        references.append(list(map(lambda x: vocab['de']['itos'][x], ref)))
+        references.append([list(map(lambda x: vocab['de']['itos'][x], ref))])
     
     for can in _candidates:
         candidates.append(list(map(lambda x: vocab['de']['itos'][x], can)))
@@ -358,6 +362,7 @@ def main():
 
                 loss += loss_mask.float() * loss_t
 
+                # use ignore class attribute of loss functions
                 loss_mask = loss_mask & (y != vocab['de']['stoi'][EOS_TOKEN])
 
             # [TODO] Normalizing by length of generated translation 
@@ -418,12 +423,7 @@ def main():
 
         bleu = compute_bleu(candidates, references, vocab)
         writer.add_scalar("Bleu", bleu, epoch)
-
-                
-
-
-
-
+        print(f"BLEU: {bleu}")
 
 if __name__ == "__main__":
 
