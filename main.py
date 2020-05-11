@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import pickle
 import glob
+import random
 
 import spacy
 import torch
@@ -23,10 +24,34 @@ from tensorboardX import SummaryWriter
 
 INIT_TOKEN = "<sos>"
 EOS_TOKEN = "<eos>"
+UNK_TOKEN = "<unk>"
+PAD_TOKEN = "<pad>"
 MODEL_CKPT_EXT = ".pth" # {epoch}.{MODEL_CHECKPOINT_EXT}
 LATEST_CKPT_NAME = "latest" 
 
-def compute_bleu(candidates, references, vocab):
+def stringify(num_sentences, vocab):
+    """Convert numericized sentences to string sentences"""
+    # num_sentences is BxT tensor of numericized sentences
+    num_sentences = num_sentences.tolist()
+    ignore_tokens = [vocab['stoi'][t] for t in [INIT_TOKEN, EOS_TOKEN, UNK_TOKEN, PAD_TOKEN]]
+
+    # [TODO] Can you remove this loop?
+    str_sentences = []    
+    for s in num_sentences:
+        # Filter s, to remote <sos>, <eos>, <pad> tokens
+        s = list(
+            filter(lambda x, ignore_tokens=ignore_tokens: x not in ignore_tokens , s)
+        )
+        # stringify
+        s = list(
+            map(lambda t, itos=vocab['itos']: itos[t], s)
+        )
+
+        str_sentences.append(s)
+
+    return str_sentences
+
+def compute_bleu(candidates, references, vocab, max_n=4):
 
     special_tokens = [vocab['de']['stoi'][t] for t in ['<pad>', '<sos>', '<eos>']]
     ignore_tokens = [vocab['de']['stoi'][t] for t in [' ']]
@@ -68,7 +93,7 @@ def compute_bleu(candidates, references, vocab):
     for can in _candidates:
         candidates.append(list(map(lambda x: vocab['de']['itos'][x], can)))
 
-    return bleu_score(candidates, references)
+    return bleu_score(candidates, references, max_n=max_n)
 
 def load_args():
 
@@ -88,7 +113,6 @@ def load_args():
     parser.add_argument("--hidden-dim", type=int, default=64)
 
     parser.add_argument("--max-seq-len", type=int, default=50)
-    parser.add_argument("--max-decoding-len", type=int, default=50)
 
     parser.add_argument("--log-dir", type=str, default="logs" )
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
@@ -97,6 +121,12 @@ def load_args():
 
     parser.add_argument("--skip-train", action='store_true',
         help="Skip Training to reach the evaluation code. Used for debugging")
+
+    parser.add_argument("--max-n", type=int, default=4,
+        help="max-n argument for bleu_score computation")
+    
+    parser.add_argument("--teacher-forcing-prob", type=float, default=0,
+        help="Rate of teacher forcing.")
 
     return parser.parse_args()
 
@@ -112,12 +142,22 @@ args.exp_name = f"{args.exp_id}" \
                 f"--em-dim-{args.embedding_dim}" \
                 f"--h-dim-{args.hidden_dim}"
 
-writer = SummaryWriter(os.path.join(args.log_dir,args.exp_name))
-# [TODO] Figureout why this is used
-#hparams_to_track = ["lr", "embedding_dim", "hidden_dim", "max_decoding_len", "exp_id", "data_dir"]
-#hparams = {k:v for k,v in vars(args).items() if k in hparams_to_track}
-#writer.add_hparams(hparam_dict=hparams)
+args.log_dir = os.path.join(args.log_dir,args.exp_name)
 
+writer = SummaryWriter(args.log_dir)
+
+# SETUP Logging of validation translations as HTML
+
+def setup_val_translation_logging():
+    args.val_translation_file = os.path.join(args.log_dir, "index.html")
+    css_file = os.path.join(args.log_dir, "txtstyle.css")
+    with open(args.val_translation_file, "w") as f:
+        f.write(f"<link href=\"txtstyle.css\" rel=\"stylesheet\" type=\"text/css\" />\n")
+
+    with open(css_file, "w") as f:
+        f.write("html, body { font-family: Helvetica, Arial, sans-serif; white-space: pre-wrap; }")
+
+setup_val_translation_logging()
 class WMT14Dataset(Dataset):
     """
     Load tokenized WMT14 Datsaet stored as processed numpy array, split across multiple files
@@ -188,12 +228,6 @@ class WMT14Dataset(Dataset):
     def __getitem__(self, idx):
         return torch.from_numpy(self.src[:, idx]).to(self.device), \
              torch.from_numpy(self.tar[:, idx]).to(self.device)
-
-
-def evaluate():
-    # Load the latest checkpointed model
-    with open(os.path.join(args.checkpoints_dir, f"{LATEST_CKPT_NAME}.{MODEL_CKPT_EXT}")):
-        pass
 
 def main():
     #######################
@@ -326,78 +360,111 @@ def main():
 
             it += 1      
 
-            src, tar = src.transpose(0, 1), tar.transpose(0, 1)
+            src, tar = src.T, tar.T
+
+            assert tar.shape[0] < args.max_seq_len, "Training data doesn't satisfy the max_seq_len constraint"
 
             B = src.size()[1]
 
-            src_enc = encoder(src) # TxBxH
+            src_enc = encoder(src) # TxBx2*H
 
-            # [TODO] Move inside the encoder
-            try:
-                # Get Hidden State for the last time-step
-                mask = (src ==  vocab['en']['stoi'][EOS_TOKEN]).unsqueeze(-1) # TxBx1
-                context = src_enc.masked_select(mask).reshape(1, B, H_e) # LSTM expects num_layers*directions as the first dimension
-            except:
-                import pdb; pdb.set_trace()
+            eos_pos = torch.nonzero(src.T ==  vocab['en']['stoi'][EOS_TOKEN])[:, -1]
+            eos_pos = eos_pos.unsqueeze(0).unsqueeze(-1).long()
 
+            eos_pos = eos_pos.expand(-1, -1, src_enc.shape[-1])
+            context = torch.gather(src_enc, 0, eos_pos)
 
-            # Teacher Forcing 
+            context = context.view(2, -1, args.hidden_dim)
+            #mask = (src ==  vocab['en']['stoi'][EOS_TOKEN]).unsqueeze(-1) # TxBx1
+
+            #context = src_enc.masked_select(mask).reshape(2, B, H_e) # LSTM expects num_layers*directions as the first dimension
+
             h, c = context, torch.zeros_like(context)
             x = torch.ones((1, B), dtype=torch.long) * vocab['de']['stoi'][INIT_TOKEN]
 
             loss_mask = torch.ones(B, dtype=torch.long)
-
-            h, c, x, loss_mask = h.to(device), c.to(device), x.to(device), loss_mask.to(device)
+            cumul_loss_mask = torch.ones_like(loss_mask)
+            h, c, x, loss_mask, cumul_loss_mask = h.to(device), c.to(device), x.to(device), loss_mask.to(device), cumul_loss_mask.to(device)
 
             seq_len = tar.size()[0]
-            loss = 0
 
-            for t in range(seq_len - 1):
+            loss = torch.zeros(B, dtype=torch.float).to(device)
+            out_list = []
+
+            outputs = torch.zeros(seq_len-1, B, len(vocab['de']['itos']), dtype=torch.float).to(device)
+            for t in range(seq_len-1):
                 # out is prob distribution over decoded sequences
                 out, h, c = decoder(x, h, c) 
-                x = out.argmax(dim=1).unsqueeze(0) # 1xB
+                outputs[t] = out
+
+                top1 = out.argmax(dim=1).unsqueeze(0) # 1xB
+                out_list.append(top1.cpu()[0])
 
                 y = tar[t + 1] # Ground Truth
-                loss_t = nn.NLLLoss(reduction='none')(out, y)
+                #loss_t = nn.NLLLoss(reduction='none')(out, y)
+                #loss += loss_mask.float() * loss_t
+                #loss_t = nn.NLLLoss(reduction='none',ignore_index=vocab['de']['stoi'][EOS_TOKEN] )(out, y)
+                #loss += loss_t
 
-                loss += loss_mask.float() * loss_t
+                x = y.unsqueeze(0) if random.uniform(0, 1) < args.teacher_forcing_prob else top1
 
                 # use ignore class attribute of loss functions
-                loss_mask = loss_mask & (y != vocab['de']['stoi'][EOS_TOKEN])
+                #loss_mask = loss_mask & (y != vocab['de']['stoi'][EOS_TOKEN])
 
-            # [TODO] Normalizing by length of generated translation 
-            loss = torch.mean(loss)
+                #cumul_loss_mask += loss_mask
+
+            outputs = outputs.view(-1, len(vocab['de']['itos']))
+            gt = tar[1:, :].reshape(-1)
+
+            loss = nn.NLLLoss(ignore_index=vocab['de']['stoi'][EOS_TOKEN])(outputs, gt)
+
+            decoded_trans = torch.stack(out_list, dim=1) # BxT
+            pretty_translations = stringify(decoded_trans, vocab['de'])
+            #if epoch == 1:
+            #    import pdb; pdb.set_trace()
+            #loss = loss / cumul_loss_mask
+            #loss = torch.mean(loss)
 
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1)
             opt.step()
 
-            del src; del tar; del src_enc; del mask; del context; del h; del c; del x; del loss_mask; del out; del y
+            del src; del tar; del src_enc; del context; del h; del c; del x; del loss_mask; del out; del y
             torch.cuda.empty_cache()
             print("[ITER]:{}\t[Loss]:{:.4f}".format(it,loss.item()))
             writer.add_scalar("Loss", loss.item(), it)
         
-        # Load the dev set, and 
+
+        ##############
+        # VALIDATION #
+        #############
+
         encoder.eval(), decoder.eval()
 
-        trans = []
+        trans_list = []
         tar_list = []
+        src_list = []
         for src, tar in dev_dataloader:
 
             src, tar = src.T, tar.T # Only works for 2D tensor
 
             tar_list.append(tar.cpu()) 
+            src_list.append(src.cpu())
 
             B = src.size()[1]
-            src_enc = encoder(src)
+            with torch.no_grad():
+                src_enc = encoder(src)
 
-            try:
-                # Get Hidden State for the last time-step
-                mask = (src ==  vocab['en']['stoi'][EOS_TOKEN]).unsqueeze(-1) # TxBx1
-                context = src_enc.masked_select(mask).reshape(1, B, H_e) # LSTM expects num_layers*directions as the first dimension
-            except:
-                import pdb; pdb.set_trace()
-            # Teacher Forcing 
+            eos_pos = torch.nonzero(src.T ==  vocab['en']['stoi'][EOS_TOKEN])[:, -1]
+            eos_pos = eos_pos.unsqueeze(0).unsqueeze(-1).long()
+
+            eos_pos = eos_pos.expand(-1, -1, src_enc.shape[-1])
+            context = torch.gather(src_enc, 0, eos_pos)
+
+            context = context.view(2, -1, args.hidden_dim)
+
             h, c = context, torch.zeros_like(context)
             trans_b = [] 
 
@@ -416,14 +483,37 @@ def main():
             trans_b.append(x[0])
 
             trans_b = torch.stack(trans_b,dim=1).T
-            trans.append(trans_b)
+            trans_list.append(trans_b)
         
-        candidates = torch.cat(trans, dim=1)
+        sources = torch.cat(src_list, dim=1)
+        candidates = torch.cat(trans_list, dim=1)
         references = torch.cat(tar_list, dim=1) 
 
         bleu = compute_bleu(candidates, references, vocab)
         writer.add_scalar("Bleu", bleu, epoch)
         print(f"BLEU: {bleu}")
+
+        ##########################
+        # VISUALIZE TRANSLATIONS #
+        ##########################
+
+        pretty_source = stringify(sources.T, vocab['en'])
+        pretty_candidates = stringify(candidates.T, vocab['de'])
+        pretty_references = stringify(references.T, vocab['de'])
+
+        translation_string = ""
+        separator = "-"*100
+        for idx, (src, can, ref) in enumerate(zip(pretty_source, pretty_candidates, pretty_references)):
+            translation_string += f"[{epoch}.{idx}][SRC]\t{' '.join(src)}\n"
+            translation_string += f"[{epoch}.{idx}][REF]\t{' '.join(ref)}\n[{epoch}.{idx}][CAN]\t{' '.join(can)}\n"
+            translation_string += (separator + "\n")
+
+        writer.add_text("translations", translation_string, epoch)
+
+        with open(args.val_translation_file, "a") as f:
+            f.write(f"{translation_string}")
+
+
 
 if __name__ == "__main__":
 

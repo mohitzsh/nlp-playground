@@ -8,7 +8,7 @@ class LSTMEncoder(nn.Module):
                 embedding_dim,
                 hidden_dim,
                 num_layers=1,
-                bidirectional=False):
+                bidirectional=True):
         super(LSTMEncoder, self).__init__()
 
         self.vocab_size = vocab_size
@@ -45,7 +45,7 @@ class LSTMDecoder(nn.Module):
                 embedding_dim,
                 hidden_dim,
                 num_layers=1,
-                bidirectional=False):
+                bidirectional=True):
         super(LSTMDecoder, self).__init__()
 
         self.vocab_size = vocab_size
