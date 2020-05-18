@@ -190,3 +190,9 @@ class Seq2Seq(nn.Module):
 
         return outputs
 
+    @property    
+    def parameter_count(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+
